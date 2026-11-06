@@ -78,7 +78,7 @@ Terraform は `terraform-credentials-fastship [args] get <ホスト>` を実行�
 - **契約企業の登録**: GitHub の org (または SA) を、registry.fastship.jp の契約企業として登録済みであること。登録していないと 401 になります。
 - **イベント**: GitHub Actions で受け付けるのは `push`・`pull_request`・`workflow_dispatch`・`schedule`・`merge_group`・`release`・`repository_dispatch` です。`pull_request_target`・`issue_comment`・`workflow_run` などは、外部の PR のコードが base のリポジトリの権限で動くことがあるため、registry が拒否します。
 - **401 になったとき**: Terraform は helper のエラーを表示せずに、トークンなしで続けます。`TF_LOG=WARN terraform init` で、`Failed to get credentials` の行に helper のエラーが出ます。
-- **トークンの有効期限**: helper の ID トークンは、`terraform init` のプロセスの中で使い回されます。GitHub Actions の ID トークンは数分で切れるため、1 回の `terraform init` がそれより長くかかると、途中から 401 になります。やり直せば、取得済みのモジュールは飛ばして続きます (トークンが要るのは versions と download だけで、zip の取得には要りません)。
+- **トークンの有効期限**: helper の ID トークンは、`terraform init` のプロセスの中で使い回されます。GitHub Actions の ID トークンは数分で切れるため、1 回の `terraform init` がそれより長くかかると、途中から 401 になります。途中で失敗した `init` は取得済みのモジュールを記録しないため、やり直すと最初から取り直します。ふつうは数分もかかりません (トークンが要るのは versions と download だけで、zip は同じリリースなら 1 回の `init` で 1 度しか取りません)。
 - **`TF_TOKEN_registry_fastship_jp`**: 設定されていると、helper より優先されます。
 - **`credentials_helper` は 1 つだけ**: CLI 設定に書けるのは 1 つです。ほかの helper (HCP Terraform 用など) とは併用できません。
 - **`TF_CLI_CONFIG_FILE`**: 設定されていると、Terraform は `~/.terraform.d/*.tfrc` を読みません。Action はそのファイルに追記するので、`TF_CLI_CONFIG_FILE` は Action より前に設定してください。ローカルでは、そのファイルに `credentials_helper` を書いてください。
