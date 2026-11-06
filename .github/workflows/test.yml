@@ -87,7 +87,7 @@ jobs:
           payload=$(cut -d. -f2 <<< "$token" | tr '_-' '/+')
           while [ $(( ${#payload} % 4 )) -ne 0 ]; do payload="${payload}="; done
           claims=$(base64 -d <<< "$payload")
-          test "$(jq -r .aud <<< "$claims")" = "https://registry.fastship.jp"
+          test "$(jq -r .aud <<< "$claims")" = "https://registry.fastship.jp/v2"
           test "$(jq -r .iss <<< "$claims")" = "https://token.actions.githubusercontent.com"
           echo "OK: aud と iss が正しい"
 

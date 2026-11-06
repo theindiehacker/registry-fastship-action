@@ -212,7 +212,7 @@ func TestSAになりすましてIDトークンを返す(t *testing.T) {
 	want := []string{
 		"auth", "print-identity-token",
 		"--impersonate-service-account=tf@acme.iam.gserviceaccount.com",
-		"--audiences=https://registry.fastship.jp",
+		"--audiences=https://registry.fastship.jp/v2",
 		"--include-email",
 	}
 	if strings.Join(f.gcloudArgs, " ") != strings.Join(want, " ") {
