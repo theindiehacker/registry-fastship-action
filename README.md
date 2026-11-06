@@ -24,12 +24,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: theindiehacker/registry-fastship-action@v2.0.0
+      - uses: theindiehacker/registry-fastship-action@v2.1.0
 
       - run: terraform init  # env は要らない
 ```
 
-- 版はタグ (`@v2.0.0`) か、コミットの SHA で固定してください。
+- 版はタグ (`@v2.1.0`) か、コミットの SHA で固定してください。
 - Action は、固定したコミットのソースから helper をビルドします (20〜40 秒)。
   - ビルドのために `actions/setup-go` で Go を入れるため、後の step の Go の版が変わります。job で Go を使うときは、自分の `setup-go` をこの Action の後に置いてください。
 - helper は、job の後の step からも使えます。ただし、`id-token: write` の job では、どの step も元から ID トークンを取れるため、取れる範囲は広がりません。
@@ -43,7 +43,7 @@ Terraform の CLI 設定のディレクトリ (`~/.terraform.d`。Windows は `%
    os=$(uname -s | tr '[:upper:]' '[:lower:]'); arch=$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')
    helper=~/.terraform.d/plugins/terraform-credentials-fastship
    mkdir -p ~/.terraform.d/plugins
-   curl -fsSL -o "$helper" "https://github.com/theindiehacker/registry-fastship-action/releases/download/v2.0.0/terraform-credentials-fastship_${os}_${arch}"
+   curl -fsSL -o "$helper" "https://github.com/theindiehacker/registry-fastship-action/releases/download/v2.1.0/terraform-credentials-fastship_${os}_${arch}"
    chmod +x "$helper"
    gh attestation verify "$helper" -R theindiehacker/registry-fastship-action  # このリポジトリの release.yml がビルドしたものか確かめる
    ```
@@ -68,7 +68,7 @@ Cloud Build では、`HOME` (`/builder/home`) が step の間で引き継がれ�
 
 Terraform は `terraform-credentials-fastship [args] get <ホスト>` を実行します。
 
-- `registry.fastship.jp` のときだけ ID トークン (audience は `https://registry.fastship.jp`) を返します。ほかのホスト (`registry.terraform.io` など) には `{}` を返し、トークンを渡しません。
+- `registry.fastship.jp` のときだけ ID トークン (audience は `https://registry.fastship.jp/v2`) を返します。ほかのホスト (`registry.terraform.io` など) には `{}` を返し、トークンを渡しません。
 - 取り方は、`--impersonate-service-account` があればなりすまし、GitHub Actions なら GitHub の OIDC、それ以外ならメタデータサーバの順です。
   - GitHub Actions では、self-hosted のランナーが Google Cloud にあっても、ランナーの SA は使いません。
 - トークンは保管しません (`terraform login` には対応していません)。
@@ -85,12 +85,14 @@ Terraform は `terraform-credentials-fastship [args] get <ホスト>` を実行�
 
 ## 🔁 v1 からの移行
 
-v1 は ID トークンを出力し、`TF_TOKEN_registry_fastship_jp` に渡していました。v2 では `token` の出力を消しました。`id` と `env` を消してください。
+v1 と v2.0.0 は使えません。registry は、v2.1.0 以降の helper が取る audience (`https://registry.fastship.jp/v2`) のトークンだけを受け付けるため、401 になります。
+
+v1 は ID トークンを出力し、`TF_TOKEN_registry_fastship_jp` に渡していました。v2 では `token` の出力を消しました。`id` と `env` を消してください。ローカルのバイナリも、v2.1.0 以降に入れ替えてください。
 
 ```diff
 -      - id: registry
 -        uses: theindiehacker/registry-fastship-action@v1.0.0
-+      - uses: theindiehacker/registry-fastship-action@v2.0.0
++      - uses: theindiehacker/registry-fastship-action@v2.1.0
        - run: terraform init
 -        env:
 -          TF_TOKEN_registry_fastship_jp: ${{ steps.registry.outputs.token }}

@@ -23,7 +23,8 @@ import (
 
 const (
 	registryHost = "registry.fastship.jp"
-	audience     = "https://registry.fastship.jp"
+	// v1 の Action (TF_TOKEN に渡す形) と区別するため、registry は helper の audience だけを受け付ける
+	audience = "https://registry.fastship.jp/v2"
 
 	impersonateFlag = "--impersonate-service-account="
 )
