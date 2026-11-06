@@ -1,23 +1,52 @@
 name: "📦 リリース"
 
-# タグ (vX.Y.Z) を push すると、ローカル向けの helper のバイナリを Release に置く。
-# GitHub Actions の Action は、Release のバイナリではなく、固定したコミットのソースからビルドする
+# Actions の画面から version: vX.Y.Z で実行すると、main の先頭にタグを付け、
+# ローカル向けの helper のバイナリと build provenance を付けた Release を作る。
+# GitHub Actions の Action は、Release のバイナリではなく、固定したコミットのソースからビルドする。
+# ワークフローの GITHUB_TOKEN で作ったタグでは、ほかのワークフローが動かないため、タグから Release までを 1 つのジョブで行う
 on:
-  push:
-    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "リリースする版 (vX.Y.Z)"
+        required: true
+        type: string
 
 permissions: {}
 
+# 同じ版を 2 回同時に作らない
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   release:
-    name: "helper のバイナリを Release に置く"
+    name: "${{ inputs.version }} をリリース"
+    # main 以外のブランチからはリリースしない
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
-      contents: write      # Release の作成
+      contents: write      # タグと Release の作成
       id-token: write      # build provenance の署名
       attestations: write  # build provenance の保存
     steps:
+      - name: "版を確かめる"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          if ! [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::version は vX.Y.Z の形で指定してください: $VERSION"
+            exit 1
+          fi
+          # 一度出した版は作り直さない (利用者は SHA で固定しているため、中身を変えるときは次の版にする)
+          if gh api "repos/$GH_REPO/git/ref/tags/$VERSION" > /dev/null 2>&1; then
+            echo "::error::$VERSION のタグは既にあります。次の版を指定してください"
+            exit 1
+          fi
+
       - name: "Checkout"
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -48,15 +77,12 @@ jobs:
         with:
           subject-path: dist/terraform-credentials-fastship_*
 
-      - name: "Release に置く"
+      # --target のコミット (ビルドしたもの) にタグを付け、Release をバイナリ付きで一度に作る
+      - name: "タグと Release を作る"
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          TAG: ${{ github.ref_name }}
+          VERSION: ${{ inputs.version }}
         run: |
-          # 画面で Release を作ってタグができたときは、その Release に足す
-          if gh release view "$TAG" > /dev/null 2>&1; then
-            gh release upload "$TAG" dist/*
-          else
-            gh release create "$TAG" dist/* --verify-tag --generate-notes --title "$TAG"
-          fi
+          gh release create "$VERSION" dist/* --target "$GITHUB_SHA" --title "$VERSION" --generate-notes
+          echo "$VERSION: $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
