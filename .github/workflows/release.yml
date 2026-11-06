@@ -1,0 +1,62 @@
+name: "📦 リリース"
+
+# タグ (vX.Y.Z) を push すると、ローカル向けの helper のバイナリを Release に置く。
+# GitHub Actions の Action は、Release のバイナリではなく、固定したコミットのソースからビルドする
+on:
+  push:
+    tags: ["v*"]
+
+permissions: {}
+
+jobs:
+  release:
+    name: "helper のバイナリを Release に置く"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write      # Release の作成
+      id-token: write      # build provenance の署名
+      attestations: write  # build provenance の保存
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      # リリースのビルドに、キャッシュ (ほかのワークフローが書いたもの) を使わない
+      - name: "Go を入れる"
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: "ビルド"
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          mkdir dist
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
+            os=${target%/*} arch=${target#*/} ext=""
+            [ "$os" = windows ] && ext=.exe
+            GOOS=$os GOARCH=$arch go build -trimpath -ldflags="-s -w" -o "dist/terraform-credentials-fastship_${os}_${arch}${ext}" .
+          done
+          (cd dist && sha256sum terraform-credentials-fastship_* > SHA256SUMS)
+          cat dist/SHA256SUMS
+
+      - name: "build provenance を付ける"
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-path: dist/terraform-credentials-fastship_*
+
+      - name: "Release に置く"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          # 画面で Release を作ってタグができたときは、その Release に足す
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" dist/*
+          else
+            gh release create "$TAG" dist/* --verify-tag --generate-notes --title "$TAG"
+          fi

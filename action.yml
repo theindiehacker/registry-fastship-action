@@ -1,43 +1,71 @@
-name: "registry.fastship.jp token"
-description: "registry.fastship.jp から terraform init でモジュールを取得するための、GitHub Actions の ID トークンを取得する"
+name: "registry.fastship.jp credentials helper"
+description: "registry.fastship.jp から terraform init でモジュールを取得できるよう、GitHub Actions の ID トークンを渡す credentials helper を入れる"
 author: "Indie Hacker, Inc."
 branding:
   icon: "lock"
   color: "blue"
 
-outputs:
-  token:
-    description: "ID トークン (audience は https://registry.fastship.jp)。terraform init の step の env TF_TOKEN_registry_fastship_jp に渡す"
-    value: ${{ steps.token.outputs.token }}
-
 runs:
   using: composite
   steps:
-    - name: "ID トークンを取得"
-      id: token
+    - name: "ID トークンを取れるか確かめる"
       shell: bash
       run: |
         if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
           echo "::error::ID トークンを取得できません。呼び出す job に permissions: id-token: write を付けてください (fork からの PR では取得できません)"
           exit 1
         fi
-
-        # リクエスト用のトークンは、コマンドの引数にもディスクにも出さないよう、パイプでヘッダーを渡す
-        # (printf は builtin のため argv に出ない。here-string は bash の版によって一時ファイルに書かれる)
-        # 発行元が応答しないときに job の timeout まで止まらないよう、時間を区切る
-        # shell: bash は -e で動くため、失敗は if で受けて、案内付きのエラーにする
-        if ! response=$(printf 'Authorization: bearer %s\n' "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" |
-          curl -sSf --retry 3 --connect-timeout 10 --max-time 30 -H @- \
-            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https%3A%2F%2Fregistry.fastship.jp"); then
-          echo "::error::GitHub から ID トークンを取得できませんでした。時間をおいて再実行してください"
-          exit 1
-        fi
-        # 応答は {"count":…,"value":"<JWT>"}。jq の無いランナーでも動くよう、sed で取り出す (JWT に " は入らない)
-        token=$(printf '%s' "$response" | sed -n 's/.*"value" *: *"\([^"]*\)".*/\1/p')
-        if [ -z "$token" ]; then
-          echo "::error::GitHub の応答に ID トークンがありませんでした"
-          exit 1
+        # TF_TOKEN_<host> は helper より優先されるため、v1 の使い方が残っていると helper が使われない
+        if [ -n "${TF_TOKEN_registry_fastship_jp:-}" ]; then
+          echo "::warning::TF_TOKEN_registry_fastship_jp が設定されているため、helper ではなく、そのトークンが使われます。v2 では消してください"
         fi
 
-        echo "::add-mask::${token}"
-        echo "token=${token}" >> "$GITHUB_OUTPUT"
+    # helper は、この Action の (固定した) コミットのソースからビルドする。配布したバイナリを信用しなくて済む
+    - name: "Go を入れる"
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+      with:
+        go-version-file: ${{ github.action_path }}/go.mod
+        # 呼び出し元のリポジトリのキャッシュを、helper のビルドに使わない
+        cache: false
+
+    - name: "credentials helper を入れる"
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        # 呼び出し元の Go の設定 (クロスコンパイル・vendor・workspace) に左右されないようにする
+        CGO_ENABLED: "0"
+        GOOS: ""
+        GOARCH: ""
+        GOFLAGS: ""
+        GOWORK: "off"
+        GOTOOLCHAIN: "local"
+      run: |
+        # Terraform は、CLI 設定のディレクトリの plugins から helper を探し、*.tfrc を CLI 設定として読む
+        if [ "$RUNNER_OS" = "Windows" ]; then
+          config_dir="$(cygpath -u "$APPDATA")/terraform.d"
+          helper="$config_dir/plugins/terraform-credentials-fastship.exe"
+        else
+          config_dir="$HOME/.terraform.d"
+          helper="$config_dir/plugins/terraform-credentials-fastship"
+        fi
+        mkdir -p "$config_dir/plugins"
+        (cd "$ACTION_PATH" && go build -trimpath -o "$helper" .)
+
+        block='credentials_helper "fastship" {}'
+        if [ -n "${TF_CLI_CONFIG_FILE:-}" ]; then
+          # TF_CLI_CONFIG_FILE があると、Terraform は CLI 設定のディレクトリの *.tfrc を読まないため、そのファイルに足す
+          config="$TF_CLI_CONFIG_FILE"
+          if [ -f "$config" ] && grep -q 'credentials_helper' "$config"; then
+            if ! grep -q 'credentials_helper "fastship"' "$config"; then
+              echo "::error::$config に、ほかの credentials_helper があります。Terraform の CLI 設定に書ける credentials_helper は 1 つだけです"
+              exit 1
+            fi
+          else
+            printf '\n%s\n' "$block" >> "$config"
+          fi
+        else
+          config="$config_dir/fastship.tfrc"
+          printf '%s\n' "$block" > "$config"
+        fi
+        echo "helper: $helper"
+        echo "CLI 設定: $config"
