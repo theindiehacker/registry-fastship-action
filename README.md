@@ -102,4 +102,10 @@ v1 は ID トークンを出力し、`TF_TOKEN_registry_fastship_jp` に渡し�
 go test ./...
 ```
 
-タグ (`vX.Y.Z`) を push すると、📦 リリース (`release.yml`) が、ローカル向けのバイナリ・`SHA256SUMS`・build provenance を Release に置きます。
+### リリース
+
+Actions → 📦 リリース (`release.yml`) を、main で `version: vX.Y.Z` を指定して実行します。タグは手で作りません。
+
+- main の先頭にタグを付け、ローカル向けのバイナリ・`SHA256SUMS`・build provenance を付けた Release を作ります。
+- 一度出した版は作り直しません。既にあるタグを指定すると失敗します。中身を直すときは、次の版を出してください。
+- 利用者は SHA で固定するので、Release の画面に出るタグのコミット SHA を案内します。
