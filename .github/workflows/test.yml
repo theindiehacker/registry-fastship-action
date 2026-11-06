@@ -13,8 +13,40 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  test:
-    name: "トークンを取得できる (${{ matrix.os }})"
+  unit:
+    name: "helper の単体テスト"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: "Go を入れる"
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: "書式"
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt -w で直してください: $unformatted"
+            exit 1
+          fi
+
+      - name: "go vet"
+        run: go vet ./...
+
+      - name: "go test"
+        run: go test -race ./...
+
+  action:
+    name: "TF_TOKEN なしで terraform get できる (${{ matrix.os }})"
     # fork からの PR では ID トークンを取得できないため動かさない
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     strategy:
@@ -22,30 +54,104 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 5
+    timeout-minutes: 10
     permissions:
       contents: read
-      id-token: write  # この Action が取得する ID トークン
+      id-token: write  # helper が取得する ID トークン
     steps:
       - name: "Checkout"
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
 
+      # setup-terraform が書く ~/.terraformrc と、helper の CLI 設定がぶつからないことも確かめる
+      - name: "Terraform を入れる"
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e  # v4.0.1
+        with:
+          terraform_wrapper: false
+
       # self-repository の形 ($/) は、actionlint・ghalint がまだ読めないため、./ にする
-      - name: "registry.fastship.jp のトークンを取得"
-        id: registry
+      - name: "credentials helper を入れる"
         uses: ./
 
       # トークンそのものは出さず、audience と発行元だけを確かめる
-      - name: "audience と発行元を確かめる"
+      - name: "helper が registry.fastship.jp の ID トークンを返す"
         shell: bash
-        env:
-          TOKEN: ${{ steps.registry.outputs.token }}
         run: |
-          payload=$(cut -d. -f2 <<< "$TOKEN" | tr '_-' '/+')
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            helper="$(cygpath -u "$APPDATA")/terraform.d/plugins/terraform-credentials-fastship.exe"
+          else
+            helper="$HOME/.terraform.d/plugins/terraform-credentials-fastship"
+          fi
+          token=$("$helper" get registry.fastship.jp | jq -r .token)
+          payload=$(cut -d. -f2 <<< "$token" | tr '_-' '/+')
           while [ $(( ${#payload} % 4 )) -ne 0 ]; do payload="${payload}="; done
           claims=$(base64 -d <<< "$payload")
           test "$(jq -r .aud <<< "$claims")" = "https://registry.fastship.jp"
           test "$(jq -r .iss <<< "$claims")" = "https://token.actions.githubusercontent.com"
           echo "OK: aud と iss が正しい"
+
+          # ほかのホスト (provider を取る registry.terraform.io など) には渡さない
+          test "$("$helper" get registry.terraform.io)" = "{}"
+          echo "OK: ほかのホストには {} を返す"
+
+      # theindiehacker は registry.fastship.jp の (社内の) 契約企業として登録してある
+      - name: "TF_TOKEN なしで、本物の registry から terraform get する"
+        shell: bash
+        working-directory: ${{ runner.temp }}
+        run: |
+          mkdir -p e2e && cd e2e
+          cat > main.tf <<'EOF'
+          module "rdb" {
+            source  = "registry.fastship.jp/modules/rdb/google"
+            version = "1.0.0"
+          }
+          EOF
+          terraform get -no-color
+          test -d .terraform/modules/rdb
+          echo "OK: モジュールを取得できた"
+
+  cli-config-file:
+    name: "TF_CLI_CONFIG_FILE があるときも terraform get できる"
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write  # helper が取得する ID トークン
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: "Terraform を入れる"
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e  # v4.0.1
+        with:
+          terraform_wrapper: false
+
+      # Terraform は TF_CLI_CONFIG_FILE があると ~/.terraform.d/*.tfrc を読まないため、helper の設定はこのファイルに足される
+      - name: "既にある CLI 設定"
+        run: |
+          config="$RUNNER_TEMP/terraformrc"
+          printf 'plugin_cache_dir = "%s"\n' "$RUNNER_TEMP" > "$config"
+          echo "TF_CLI_CONFIG_FILE=$config" >> "$GITHUB_ENV"
+
+      - name: "credentials helper を入れる"
+        uses: ./
+
+      - name: "TF_TOKEN なしで、本物の registry から terraform get する"
+        working-directory: ${{ runner.temp }}
+        run: |
+          grep -q 'plugin_cache_dir' "$TF_CLI_CONFIG_FILE"
+          grep -q 'credentials_helper "fastship"' "$TF_CLI_CONFIG_FILE"
+          mkdir -p e2e && cd e2e
+          cat > main.tf <<'EOF'
+          module "rdb" {
+            source  = "registry.fastship.jp/modules/rdb/google"
+            version = "1.0.0"
+          }
+          EOF
+          terraform get -no-color
+          test -d .terraform/modules/rdb
+          echo "OK: モジュールを取得できた"
