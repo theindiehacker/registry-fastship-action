@@ -1,0 +1,208 @@
+name: "🐳 イメージの publish"
+
+# プロバイダーのリポジトリが呼ぶ reusable workflow。Docker イメージをビルドして、会社の Artifact Registry に push する。
+# - 認証は WIF。registry は、この workflow (main かタグの版) を通したジョブ (job_workflow_ref) にだけ push の SA を貸す。
+#   そのため、呼び出し元は、この workflow を SHA ではなくタグか main で指定する (SHA だと job_workflow_ref が @<SHA> になり、借りられない)
+# - 同じタグが既にあれば、ビルドせずに、そのイメージの digest を出す (途中で失敗したときに、同じ版でやり直せる)
+# - 処理の中身は tests/publish_test.sh が、step を抜き出してローカルの registry で確かめる
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: "イメージの名前 (例: api)。小文字・数字・区切り (. _ - /) だけ"
+        required: true
+        type: string
+      version:
+        description: "タグ (例: v1.2.3)。付け替えられないため latest は使えない"
+        required: true
+        type: string
+      context:
+        description: "ビルドのコンテキスト (リポジトリの中のディレクトリ)"
+        required: false
+        type: string
+        default: "."
+      file:
+        description: "Dockerfile のパス (リポジトリの根から)。省略すると <context>/Dockerfile"
+        required: false
+        type: string
+        default: ""
+      target:
+        description: "Dockerfile の target (多段ビルドのステージ)。省略すると最後のステージ"
+        required: false
+        type: string
+        default: ""
+      repository:
+        description: "push 先の Docker リポジトリ (<リージョン>-docker.pkg.dev/<プロジェクト>/<リポジトリ>)。registry の bootstrap の出力 image_publish の IMAGE_REPOSITORY"
+        required: true
+        type: string
+      workload_identity_provider:
+        description: "WIF のプロバイダー (projects/<番号>/locations/global/workloadIdentityPools/<プール>/providers/<プロバイダー>)。image_publish の WIF_PROVIDER_NAME"
+        required: true
+        type: string
+      service_account:
+        description: "push の SA のメール。image_publish の IMAGE_SERVICE_ACCOUNT_EMAIL"
+        required: true
+        type: string
+    outputs:
+      digest:
+        description: "イメージの digest (sha256:…)。スキップしたときは、既にあるイメージの digest"
+        value: ${{ jobs.publish.outputs.digest }}
+      image:
+        description: "digest で指定したイメージ (<repository>/<image>@sha256:…)"
+        value: ${{ jobs.publish.outputs.image }}
+      pushed:
+        description: "push したら true、同じタグが既にあってスキップしたら false"
+        value: ${{ jobs.publish.outputs.pushed }}
+
+permissions: {}
+
+jobs:
+  publish:
+    name: "${{ inputs.image }}:${{ inputs.version }} を publish"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read  # 呼び出し元のリポジトリの checkout
+      id-token: write  # WIF で使う ID トークン
+    outputs:
+      digest: ${{ steps.exists.outputs.digest || steps.build.outputs.digest }}
+      image: ${{ steps.check.outputs.image }}@${{ steps.exists.outputs.digest || steps.build.outputs.digest }}
+      pushed: ${{ steps.exists.outputs.exists == 'false' }}
+    steps:
+      - name: "入力を確かめる"
+        id: check
+        env:
+          IMAGE: ${{ inputs.image }}
+          VERSION: ${{ inputs.version }}
+          REPOSITORY: ${{ inputs.repository }}
+        run: |
+          # Docker のイメージ名の形 (大文字は使えない)
+          if ! [[ "$IMAGE" =~ ^[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)*$ ]]; then
+            echo "::error::image には、小文字・数字と区切り (. _ - /) だけのイメージ名を書いてください (タグは version に書く): $IMAGE"
+            exit 1
+          fi
+          # Docker のタグの形。タグは付け替えられないため、latest は一度しか使えず、意味が無い
+          if ! [[ "$VERSION" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]] || [ "$VERSION" = "latest" ]; then
+            echo "::error::version には、latest 以外のタグ (v1.2.3 など) を書いてください: $VERSION"
+            exit 1
+          fi
+          if ! [[ "$REPOSITORY" =~ ^([a-z0-9-]+-docker\.pkg\.dev)/([a-z][a-z0-9-]{4,28}[a-z0-9])/([a-z]([a-z0-9-]*[a-z0-9])?)$ ]]; then
+            echo "::error::repository には、Artifact Registry の Docker リポジトリ (<リージョン>-docker.pkg.dev/<プロジェクト>/<リポジトリ>。スキームは書かない) を書いてください: $REPOSITORY"
+            exit 1
+          fi
+          host=${BASH_REMATCH[1]}
+          {
+            echo "host=$host"
+            echo "image=$REPOSITORY/$IMAGE"
+            echo "path=${REPOSITORY#"$host/"}/$IMAGE"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: "Google Cloud に認証する (WIF)"
+        id: auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093  # v3.0.0
+        with:
+          workload_identity_provider: ${{ inputs.workload_identity_provider }}
+          service_account: ${{ inputs.service_account }}
+          token_format: access_token
+          # 呼び出し元の checkout に認証情報のファイルを置かない
+          create_credentials_file: false
+
+      - name: "Artifact Registry にログインする"
+        env:
+          HOST: ${{ steps.check.outputs.host }}
+          TOKEN: ${{ steps.auth.outputs.access_token }}
+        run: docker login --username oauth2accesstoken --password-stdin "https://$HOST" <<< "$TOKEN"
+
+      - name: "同じタグがあるか確かめる"
+        id: exists
+        env:
+          REGISTRY_URL: https://${{ steps.check.outputs.host }}
+          IMAGE_PATH: ${{ steps.check.outputs.path }}
+          VERSION: ${{ inputs.version }}
+          TOKEN: ${{ steps.auth.outputs.access_token }}
+        run: |
+          headers=$(mktemp)
+          # マニフェストの一覧 (index) も受け付け、push したときと同じ digest を返させる
+          status=$(curl -sS -o /dev/null -D "$headers" -w '%{http_code}' --head \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.oci.image.index.v1+json" \
+            -H "Accept: application/vnd.docker.distribution.manifest.list.v2+json" \
+            -H "Accept: application/vnd.oci.image.manifest.v1+json" \
+            -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
+            "$REGISTRY_URL/v2/$IMAGE_PATH/manifests/$VERSION") || {
+            echo "::error::registry ($REGISTRY_URL) に繋がりません"
+            exit 1
+          }
+          case "$status" in
+            200)
+              digest=$(grep -i '^docker-content-digest:' "$headers" | head -1 | cut -d: -f2- | tr -d ' \r')
+              if ! [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+                echo "::error::$IMAGE_PATH:$VERSION の digest を読めません"
+                exit 1
+              fi
+              echo "::notice::$IMAGE_PATH:$VERSION は既にあるため、ビルドしません ($digest)。中身を変えるときは、次の版で publish してください"
+              { echo "exists=true"; echo "digest=$digest"; } >> "$GITHUB_OUTPUT"
+              ;;
+            404)
+              echo "exists=false" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              # 無いとみなしてビルドすると、権限の誤りなどを隠すため、失敗にする
+              echo "::error::$IMAGE_PATH:$VERSION があるか確かめられません (HTTP $status)"
+              exit 1
+              ;;
+          esac
+
+      - name: "Checkout"
+        id: checkout
+        if: steps.exists.outputs.exists == 'false'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: "ビルドして push する"
+        id: build
+        if: steps.exists.outputs.exists == 'false'
+        env:
+          IMAGE: ${{ steps.check.outputs.image }}
+          VERSION: ${{ inputs.version }}
+          CONTEXT: ${{ inputs.context }}
+          FILE: ${{ inputs.file }}
+          TARGET: ${{ inputs.target }}
+        run: |
+          metadata="$RUNNER_TEMP/build-metadata.json"
+          args=(
+            --push
+            --tag "$IMAGE:$VERSION"
+            --metadata-file "$metadata"
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+            --label "org.opencontainers.image.revision=$GITHUB_SHA"
+            --label "org.opencontainers.image.version=$VERSION"
+          )
+          if [ -n "$FILE" ]; then args+=(--file "$FILE"); fi
+          if [ -n "$TARGET" ]; then args+=(--target "$TARGET"); fi
+          docker buildx build "${args[@]}" "$CONTEXT"
+          digest=$(jq -r '."containerimage.digest" // empty' "$metadata")
+          if ! [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::push したイメージの digest を読めません"
+            exit 1
+          fi
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: "結果"
+        env:
+          IMAGE: ${{ steps.check.outputs.image }}
+          VERSION: ${{ inputs.version }}
+          DIGEST: ${{ steps.exists.outputs.digest || steps.build.outputs.digest }}
+          PUSHED: ${{ steps.exists.outputs.exists == 'false' }}
+        run: |
+          if [ "$PUSHED" = "true" ]; then result="push しました"; else result="既にあるため、スキップしました"; fi
+          {
+            echo "### 🐳 $IMAGE:$VERSION"
+            echo
+            echo "$result"
+            echo
+            echo '```sh'
+            echo "docker pull $IMAGE@$DIGEST"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
