@@ -6,6 +6,7 @@ Action は Terraform の [credentials helper](https://developer.hashicorp.com/te
 
 - 既定のホストは `registry.fastship.jp` です。ほかの会社の registry には `host` を指定します。
 - PC では、この helper ではなく `terraform login <host>` を使います ([PC から helper を消す](#-pc-から-helper-を消す))。
+- モジュールを registry に上げる reusable workflow もあります ([モジュールの upload](#-モジュールの-upload))。
 - Docker イメージを会社の Artifact Registry に push する reusable workflow もあります ([Docker イメージの publish](#-docker-イメージの-publish))。
 
 ## 📖 使い方
@@ -60,6 +61,86 @@ Terraform は `terraform-credentials-fastship --host=<host> get <ホスト>` を
 - **`TF_TOKEN_<host>`**: 設定されていると、helper より優先されます (Action が警告を出します)。
 - **`credentials_helper` は 1 つだけ**: CLI 設定に書けるのは 1 つです。ほかの helper とは併用できず、1 つの job で使える `host` も 1 つです。
 - **`TF_CLI_CONFIG_FILE`**: 設定されていると、Terraform は `~/.terraform.d/*.tfrc` を読みません。Action はそのファイルに追記するので、`TF_CLI_CONFIG_FILE` は Action より前に設定してください。
+
+## 🧩 モジュールの upload
+
+`.github/workflows/upload.yml` は、指定したディレクトリだけを zip にして、registry の API (`POST /v1/modules/<namespace>/<name>/<system>/<版>`) に上げる reusable workflow です。認証は GitHub Actions の ID トークンで、鍵は要りません。
+
+```yaml
+# 呼び出し元のリポジトリの .github/workflows/upload.yml
+name: "🧩 モジュールの upload"
+
+on:
+  workflow_dispatch:
+    inputs:
+      namespace:
+        description: "namespace"
+        required: true
+        type: string
+      name:
+        description: "name"
+        required: true
+        type: string
+      system:
+        description: "system (google・aws など)"
+        required: true
+        type: string
+      path:
+        description: "モジュールのディレクトリ (リポジトリの根から)"
+        required: true
+        type: string
+      version:
+        description: "版 (X.Y.Z)"
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  upload:
+    permissions:
+      contents: read
+      id-token: write  # registry に送る ID トークン
+    uses: theindiehacker/registry-fastship-action/.github/workflows/upload.yml@<版または SHA>
+    with:
+      host: registry.example.io  # 省略すると registry.fastship.jp
+      namespace: ${{ inputs.namespace }}
+      name: ${{ inputs.name }}
+      system: ${{ inputs.system }}
+      path: ${{ inputs.path }}
+      version: ${{ inputs.version }}
+```
+
+Actions の画面で、保護したデフォルトブランチを選んで実行します。上げた版は、すぐに `terraform init` で取得できます。
+
+```hcl
+module "network" {
+  source  = "registry.example.io/<namespace>/<name>/<system>"
+  version = "1.2.3"
+}
+```
+
+| 入力 | 既定 | 説明 |
+|---|---|---|
+| `host` | `registry.fastship.jp` | registry のホスト名。スキーム・ポート・パスは書きません |
+| `namespace` | (必須) | 英小文字・数字・`-` `_` (先頭と末尾は英小文字か数字、64 文字まで) |
+| `name` | (必須) | `namespace` と同じ形 |
+| `system` | (必須) | 英小文字・数字 (`google`・`aws` など) |
+| `path` | `.` | モジュールのディレクトリ (リポジトリの根からの相対パス) |
+| `version` | (必須) | 版 (`1.2.3`)。先頭の `v` は外すので、タグの名前 (`v1.2.3`) も渡せます |
+
+| 出力 | 説明 |
+|---|---|
+| `source` | `module` ブロックの `source` (`<host>/<namespace>/<name>/<system>`) |
+| `version` | 上げた版 (`X.Y.Z`) |
+
+- **上げられるワークフロー**: registry が受け付ける GitHub 組織のリポジトリの、`push`・`workflow_dispatch`・`release` だけです。ref は、**保護した**デフォルトブランチか、ルールセットで**保護した**タグだけです (ID トークンの `ref_protected`)。保護していないと 403 になります。組織のどのリポジトリからでも、どのモジュールの版も上げられます。
+- **同じ版は上書きしない**: 同じ版が既にあれば (削除した版も)、registry が 409 を返し、workflow は失敗します。中身が同じでも上書きしません。中身を変えるときは、次の版で上げてください。
+  - 応答が届かずに失敗したときは、やり直す前に `versions` で上がったかを確かめてください (上がっていれば、やり直すと 409 になります)。
+- **zip の中身**: `path` のディレクトリの中身を、zip の直下に入れます (直下に `.tf` が要ります)。`.git`・`.terraform` のディレクトリは入れません。シンボリックリンクがあれば失敗します。zip は 4 MB までです。同じ中身からは、同じ zip を作ります。
+- **README と inputs/outputs**: registry が、zip の `README.md` と直下の `.tf` の `variable`・`output` を読み取ります。
+- **版の固定**: この workflow は、タグか SHA で指定できます (イメージの publish と違い、registry は `job_workflow_ref` を見ません)。
+- **タグから上げる**: `release` や、タグの `push` から呼ぶときは、`version: ${{ github.ref_name }}` と書けます。1 つのリポジトリに複数のモジュールがあるときは、モジュールごとに job (か matrix) を並べます。
 
 ## 🐳 Docker イメージの publish
 
@@ -164,6 +245,9 @@ v1 は ID トークンを出力し、`TF_TOKEN_registry_fastship_jp` に渡し�
 
 ```bash
 go test ./...
+
+# モジュールの upload の reusable workflow (python3・jq・yq・curl が要る。偽の registry で動かす)
+bash tests/upload_test.sh
 
 # イメージの publish の reusable workflow (docker・jq・yq が要る。ローカルの registry:2 で動かす)
 bash tests/publish_test.sh
