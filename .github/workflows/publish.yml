@@ -75,7 +75,16 @@ jobs:
           IMAGE: ${{ inputs.image }}
           VERSION: ${{ inputs.version }}
           REPOSITORY: ${{ inputs.repository }}
+          CONTEXT: ${{ inputs.context }}
+          FILE: ${{ inputs.file }}
         run: |
+          # context と file は、リポジトリの中だけ (docker login の認証情報など、checkout の外のファイルをビルドに入れさせない)
+          for path in "$CONTEXT" "$FILE"; do
+            if [[ "$path" == /* || "$path" == "~"* || "/$path/" == *"/../"* ]]; then
+              echo "::error::context と file には、リポジトリの中の相対パス (.. を含まない) を書いてください: $path"
+              exit 1
+            fi
+          done
           # Docker のイメージ名の形 (大文字は使えない)
           if ! [[ "$IMAGE" =~ ^[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)*$ ]]; then
             echo "::error::image には、小文字・数字と区切り (. _ - /) だけのイメージ名を書いてください (タグは version に書く): $IMAGE"
@@ -111,7 +120,11 @@ jobs:
         env:
           HOST: ${{ steps.check.outputs.host }}
           TOKEN: ${{ steps.auth.outputs.access_token }}
-        run: docker login --username oauth2accesstoken --password-stdin "https://$HOST" <<< "$TOKEN"
+        run: |
+          # 認証情報は、checkout (ビルドのコンテキスト) の外の、この job だけのディレクトリに置く
+          export DOCKER_CONFIG="$RUNNER_TEMP/docker-config"
+          echo "DOCKER_CONFIG=$DOCKER_CONFIG" >> "$GITHUB_ENV"
+          docker login --username oauth2accesstoken --password-stdin "https://$HOST" <<< "$TOKEN"
 
       - name: "同じタグがあるか確かめる"
         id: exists

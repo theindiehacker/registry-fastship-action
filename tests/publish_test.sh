@@ -56,7 +56,13 @@ fail() {
 
 # ---- 入力の検査 (check) ----
 
-check_env=(IMAGE=sample VERSION=v1.0.0 REPOSITORY=asia-northeast1-docker.pkg.dev/my-project/apps)
+check_env=(IMAGE=sample VERSION=v1.0.0 REPOSITORY=asia-northeast1-docker.pkg.dev/my-project/apps CONTEXT=. FILE=)
+
+if run_step check "${check_env[@]}" CONTEXT=services/api FILE=services/api/Dockerfile.prod > /dev/null; then
+  pass "check: リポジトリの中の相対パスの context・file を受け付ける"
+else
+  fail "check: リポジトリの中の context・file を断った"
+fi
 
 if run_step check "${check_env[@]}" > /dev/null; then
   if [ "$(output host)" = "asia-northeast1-docker.pkg.dev" ] &&
@@ -88,7 +94,13 @@ for bad in \
   "REPOSITORY=docker.io/library" \
   "REPOSITORY=https://asia-northeast1-docker.pkg.dev/my-project/apps" \
   "REPOSITORY=asia-northeast1-docker.pkg.dev/my-project" \
-  "REPOSITORY=asia-northeast1-docker.pkg.dev/my-project/apps/sample"; do
+  "REPOSITORY=asia-northeast1-docker.pkg.dev/my-project/apps/sample" \
+  "CONTEXT=/home/runner" \
+  "CONTEXT=.." \
+  "CONTEXT=app/../.." \
+  "CONTEXT=~" \
+  "FILE=/etc/Dockerfile" \
+  "FILE=../Dockerfile"; do
   if run_step check "${check_env[@]}" "$bad" > /dev/null 2>&1; then
     fail "check: $bad を受け付けた"
   else
