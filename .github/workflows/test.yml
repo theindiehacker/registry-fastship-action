@@ -75,7 +75,7 @@ jobs:
         uses: ./
 
       # トークンそのものは出さず、audience と発行元だけを確かめる
-      - name: "helper が registry.fastship.jp の ID トークンを返す"
+      - name: "host を指定しないと、helper が registry.fastship.jp の ID トークンを返す"
         shell: bash
         run: |
           if [ "$RUNNER_OS" = "Windows" ]; then
@@ -90,12 +90,14 @@ jobs:
           test "$(jq -r .aud <<< "$claims")" = "https://registry.fastship.jp/v2"
           test "$(jq -r .iss <<< "$claims")" = "https://token.actions.githubusercontent.com"
           echo "OK: aud と iss が正しい"
+          grep -qxF 'credentials_helper "fastship" { args = ["--host=registry.fastship.jp"] }' "$(dirname "$(dirname "$helper")")/fastship.tfrc"
+          echo "OK: host を指定しないと registry.fastship.jp になる"
 
           # ほかのホスト (provider を取る registry.terraform.io など) には渡さない
           test "$("$helper" get registry.terraform.io)" = "{}"
           echo "OK: ほかのホストには {} を返す"
 
-      # theindiehacker は registry.fastship.jp の (社内の) 契約企業として登録してある
+      # registry.fastship.jp は、theindiehacker の組織のワークフローの ID トークンを受け付ける
       - name: "TF_TOKEN なしで、本物の registry から terraform get する"
         shell: bash
         working-directory: ${{ runner.temp }}
@@ -155,3 +157,55 @@ jobs:
           terraform get -no-color
           test -d .terraform/modules/rdb
           echo "OK: モジュールを取得できた"
+
+  host:
+    name: "host を指定すると、そのホストにだけトークンを渡す"
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write  # helper が取得する ID トークン
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: "スキームを付けたホストは断る"
+        id: invalid
+        continue-on-error: true
+        uses: ./
+        with:
+          host: "https://registry.example.io"
+
+      - name: "断ったことを確かめる"
+        env:
+          OUTCOME: ${{ steps.invalid.outcome }}
+        run: |
+          test "$OUTCOME" = "failure"
+          test ! -e ~/.terraform.d/fastship.tfrc
+          echo "OK: 断った"
+
+      - name: "credentials helper を入れる"
+        uses: ./
+        with:
+          host: "Registry.Example.IO"
+
+      # トークンそのものは出さず、audience と発行元だけを確かめる
+      - name: "helper が指定したホストの ID トークンだけを返す"
+        run: |
+          grep -qxF 'credentials_helper "fastship" { args = ["--host=registry.example.io"] }' ~/.terraform.d/fastship.tfrc
+          helper="$HOME/.terraform.d/plugins/terraform-credentials-fastship"
+          token=$("$helper" --host=registry.example.io get registry.example.io | jq -r .token)
+          payload=$(cut -d. -f2 <<< "$token" | tr '_-' '/+')
+          while [ $(( ${#payload} % 4 )) -ne 0 ]; do payload="${payload}="; done
+          claims=$(base64 -d <<< "$payload")
+          test "$(jq -r .aud <<< "$claims")" = "https://registry.example.io/v2"
+          test "$(jq -r .iss <<< "$claims")" = "https://token.actions.githubusercontent.com"
+          echo "OK: aud と iss が正しい"
+
+          # 既定のホスト (registry.fastship.jp) にも、ほかのホストにも渡さない
+          test "$("$helper" --host=registry.example.io get registry.fastship.jp)" = "{}"
+          test "$("$helper" --host=registry.example.io get registry.terraform.io)" = "{}"
+          echo "OK: ほかのホストには {} を返す"

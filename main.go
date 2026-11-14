@@ -1,8 +1,9 @@
-// terraform-credentials-fastship は、registry.fastship.jp の Terraform の credentials helper。
-// Terraform がモジュールを取得するときに、動いている環境の ID (GitHub Actions・Google Cloud の SA) の ID トークンを、その場で取って渡す。
+// terraform-credentials-fastship は、Private Registry (既定は registry.fastship.jp) の Terraform の credentials helper。
+// Terraform がモジュールを取得するときに、GitHub Actions の ID トークンを、その場で取って渡す。
 // トークンは保管しない (取るたびに新しくなるため、有効期限を気にしなくてよい)。
+// PC では使わない (terraform login を使う)。
 //
-// 使い方 (Terraform が呼ぶ): terraform-credentials-fastship [--impersonate-service-account=<SA>] get <ホスト>
+// 使い方 (Terraform が呼ぶ): terraform-credentials-fastship [--host=<registry のホスト>] get <ホスト>
 // プロトコル: https://developer.hashicorp.com/terraform/internals/credentials-helpers
 package main
 
@@ -16,33 +17,30 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
+	"regexp"
 	"strings"
 	"time"
 )
 
 const (
-	registryHost = "registry.fastship.jp"
-	// v1 の Action (TF_TOKEN に渡す形) と区別するため、registry は helper の audience だけを受け付ける
-	audience = "https://registry.fastship.jp/v2"
+	// --host を指定しないときのホスト (v2.1.0 までの使い方のまま動かすため)
+	defaultHost = "registry.fastship.jp"
 
-	impersonateFlag = "--impersonate-service-account="
+	hostFlag = "--host="
 )
 
-// errNoSource は、ID トークンを取れる環境 (GitHub Actions・Google Cloud・SA のなりすまし) でないこと
-var errNoSource = errors.New(`ID トークンを取れる環境ではありません。
-- ローカル: CLI 設定の credentials_helper "fastship" の args に "` + impersonateFlag + `<登録した SA>" を書き、gcloud auth login でログインしてください
-- GitHub Actions: theindiehacker/registry-fastship-action を使い、job に permissions: id-token: write を付けてください
-- Google Cloud: メタデータサーバのある環境 (Cloud Build・Compute Engine など) で動かしてください`)
+// hostPattern は、registry のホスト名 (スキーム・ポート・パスを書かない、ドットを含む名前)
+var hostPattern = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$`)
+
+// audienceOf は、registry が受け付ける audience。v1 の Action (TF_TOKEN に渡す形) と区別するため、/v2 を付ける
+func audienceOf(host string) string {
+	return "https://" + host + "/v2"
+}
 
 // deps は、外の世界とのやり取り。テストで差し替える
 type deps struct {
 	getenv func(string) string
-	// gcloud は gcloud を args で動かし、stdout を返す。gcloud の stderr は、そのまま helper の stderr に出す
-	gcloud func(ctx context.Context, args []string, stderr io.Writer) ([]byte, error)
-	// client は GitHub に、metadataClient はメタデータサーバに使う
-	client         *http.Client
-	metadataClient *http.Client
+	client *http.Client
 	// wait はリトライの前に待つ時間 (attempt は 1 から)
 	wait func(attempt int) time.Duration
 }
@@ -54,11 +52,6 @@ func main() {
 func defaultDeps() deps {
 	return deps{
 		getenv: os.Getenv,
-		gcloud: func(ctx context.Context, args []string, stderr io.Writer) ([]byte, error) {
-			cmd := exec.CommandContext(ctx, "gcloud", args...)
-			cmd.Stderr = stderr
-			return cmd.Output()
-		},
 		// 発行元が応答しないときに、job の timeout まで止まらないよう、時間を区切る
 		client: &http.Client{
 			Transport: &http.Transport{
@@ -69,29 +62,20 @@ func defaultDeps() deps {
 			},
 			Timeout: 30 * time.Second,
 		},
-		// メタデータサーバはプロキシを通さない (Google のクライアントライブラリと同じ)。
-		// Google Cloud の外では、名前が引けないか繋がらずに失敗するので、接続の時間を短くする
-		metadataClient: &http.Client{
-			Transport: &http.Transport{
-				DialContext:           (&net.Dialer{Timeout: 2 * time.Second}).DialContext,
-				ResponseHeaderTimeout: 30 * time.Second,
-			},
-			Timeout: 30 * time.Second,
-		},
 		wait: func(attempt int) time.Duration { return time.Duration(1<<(attempt-1)) * time.Second },
 	}
 }
 
 // run は helper の本体。終了コードを返す
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer, d deps) int {
-	var serviceAccount string
+	registryHost := defaultHost
 	var positional []string
 	for _, arg := range args {
 		switch {
-		case strings.HasPrefix(arg, impersonateFlag):
-			serviceAccount = strings.TrimPrefix(arg, impersonateFlag)
-			if serviceAccount == "" {
-				fmt.Fprintf(stderr, "%s に SA のメールアドレスを書いてください\n", impersonateFlag)
+		case strings.HasPrefix(arg, hostFlag):
+			registryHost = strings.ToLower(strings.TrimPrefix(arg, hostFlag))
+			if !hostPattern.MatchString(registryHost) {
+				fmt.Fprintf(stderr, "%s には、registry のホスト名 (registry.example.io の形。スキーム・ポート・パスは書かない) を書いてください: %q\n", hostFlag, registryHost)
 				return 1
 			}
 		case strings.HasPrefix(arg, "-"):
@@ -102,21 +86,21 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, d deps) int {
 		}
 	}
 	if len(positional) != 2 {
-		fmt.Fprintf(stderr, "使い方: terraform-credentials-fastship [%s<SA>] get <ホスト>\n", impersonateFlag)
+		fmt.Fprintf(stderr, "使い方: terraform-credentials-fastship [%s<registry のホスト>] get <ホスト>\n", hostFlag)
 		return 1
 	}
 	verb, host := positional[0], positional[1]
 
 	switch verb {
 	case "get":
-		// registry.fastship.jp のほか (registry.terraform.io など) には、トークンを渡さない
+		// 指定したホストのほか (registry.terraform.io など) には、トークンを渡さない
 		if !strings.EqualFold(host, registryHost) {
 			fmt.Fprintln(stdout, "{}")
 			return 0
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
-		token, err := identityToken(ctx, serviceAccount, d, stderr)
+		token, err := githubToken(ctx, audienceOf(registryHost), d)
 		if err != nil {
 			fmt.Fprintln(stderr, err)
 			return 1
@@ -129,7 +113,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, d deps) int {
 	case "store":
 		// 失敗するときも、Terraform が送ってくる資格情報を読み切る (プロトコルの決まり)
 		_, _ = io.Copy(io.Discard, stdin)
-		fmt.Fprintln(stderr, "terraform login には対応していません (ID トークンを毎回その場で取るため、保管は要りません)")
+		fmt.Fprintln(stderr, "terraform login には対応していません。PC では helper と fastship.tfrc を消してから terraform login してください")
 		return 1
 	case "forget":
 		// 何も保管していないので、消すものも無い
@@ -140,39 +124,10 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, d deps) int {
 	}
 }
 
-// identityToken は、環境に合った方法で ID トークンを取る
-func identityToken(ctx context.Context, serviceAccount string, d deps, stderr io.Writer) (string, error) {
-	// 1. SA のなりすまし (ローカル)。CLI 設定で指定したときだけ使う
-	if serviceAccount != "" {
-		return impersonatedToken(ctx, serviceAccount, d, stderr)
+func githubToken(ctx context.Context, audience string, d deps) (string, error) {
+	if d.getenv("GITHUB_ACTIONS") != "true" {
+		return "", errors.New("GitHub Actions の外では使えません。PC では helper と fastship.tfrc を消してから terraform login してください")
 	}
-	// 2. GitHub Actions。self-hosted のランナーが Google Cloud にあっても、ランナーの SA ではなく、ワークフローの ID を使う
-	if d.getenv("GITHUB_ACTIONS") == "true" {
-		return githubToken(ctx, d)
-	}
-	// 3. Google Cloud のメタデータサーバ (Cloud Build・Compute Engine など)
-	return metadataToken(ctx, d)
-}
-
-func impersonatedToken(ctx context.Context, serviceAccount string, d deps, stderr io.Writer) (string, error) {
-	out, err := d.gcloud(ctx, []string{
-		"auth", "print-identity-token",
-		"--impersonate-service-account=" + serviceAccount,
-		"--audiences=" + audience,
-		// email が無いと、registry が契約企業を引けず 401 になる
-		"--include-email",
-	}, stderr)
-	if err != nil {
-		var notFound *exec.Error
-		if errors.As(err, &notFound) {
-			return "", errors.New("gcloud が見つかりません。Google Cloud CLI を入れてください")
-		}
-		return "", fmt.Errorf("gcloud で %s の ID トークンを取れませんでした (gcloud auth login と、SA の roles/iam.serviceAccountTokenCreator を確かめてください): %w", serviceAccount, err)
-	}
-	return checkToken(string(out))
-}
-
-func githubToken(ctx context.Context, d deps) (string, error) {
 	requestURL, requestToken := d.getenv("ACTIONS_ID_TOKEN_REQUEST_URL"), d.getenv("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
 	if requestURL == "" || requestToken == "" {
 		return "", errors.New("GitHub Actions の ID トークンを取れません。job に permissions: id-token: write を付けてください (fork からの PR では取れません)")
@@ -196,27 +151,6 @@ func githubToken(ctx context.Context, d deps) (string, error) {
 		return "", fmt.Errorf("GitHub の応答を読めませんでした: %w", err)
 	}
 	return checkToken(response.Value)
-}
-
-func metadataToken(ctx context.Context, d deps) (string, error) {
-	host := d.getenv("GCE_METADATA_HOST") // Google のクライアントライブラリと同じく、エミュレーターなどに向けられる
-	if host == "" {
-		host = "metadata.google.internal"
-	}
-	u := url.URL{
-		Scheme:   "http",
-		Host:     host,
-		Path:     "/computeMetadata/v1/instance/service-accounts/default/identity",
-		RawQuery: url.Values{"audience": {audience}, "format": {"full"}}.Encode(), // full: email が入る
-	}
-	body, err := fetch(ctx, d.metadataClient, d.wait, u.String(), map[string]string{"Metadata-Flavor": "Google"})
-	if err != nil {
-		if isDialError(err) {
-			return "", errNoSource
-		}
-		return "", fmt.Errorf("メタデータサーバから ID トークンを取れませんでした: %w", err)
-	}
-	return checkToken(string(body))
 }
 
 // fetch は GET し、本文を返す。一時的な失敗 (接続の後の失敗・408・429・5xx) は、間をあけて 3 回までやり直す
@@ -253,7 +187,7 @@ func fetchOnce(ctx context.Context, client *http.Client, target string, header m
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		// 繋がらない (Google Cloud の外のメタデータサーバなど) は、やり直しても変わらない
+		// 名前を引けない・繋がらないは、やり直しても変わらない
 		return nil, !isDialError(err), err
 	}
 	defer resp.Body.Close()

@@ -1,24 +1,41 @@
-name: "registry.fastship.jp credentials helper"
-description: "registry.fastship.jp から terraform init でモジュールを取得できるよう、GitHub Actions の ID トークンを渡す credentials helper を入れる"
+name: "Private Terraform Registry credentials helper"
+description: "Private Registry (既定は registry.fastship.jp) から terraform init でモジュールを取得できるよう、GitHub Actions の ID トークンを渡す credentials helper を入れる"
 author: "Indie Hacker, Inc."
 branding:
   icon: "lock"
   color: "blue"
 
+inputs:
+  host:
+    description: "registry のホスト名 (スキーム・ポート・パスは書かない)。helper は、このホストにだけ ID トークン (audience は https://<host>/v2) を渡す"
+    required: false
+    default: "registry.fastship.jp"
+
 runs:
   using: composite
   steps:
     - name: "ID トークンを取れるか確かめる"
+      id: check
       shell: bash
+      env:
+        HOST: ${{ inputs.host }}
       run: |
+        host=$(tr '[:upper:]' '[:lower:]' <<< "$HOST")
+        if ! [[ "$host" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]]; then
+          echo "::error::host には、registry のホスト名 (registry.example.io の形。スキーム・ポート・パスは書かない) を書いてください: $HOST"
+          exit 1
+        fi
         if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
           echo "::error::ID トークンを取得できません。呼び出す job に permissions: id-token: write を付けてください (fork からの PR では取得できません)"
           exit 1
         fi
         # TF_TOKEN_<host> は helper より優先されるため、v1 の使い方が残っていると helper が使われない
-        if [ -n "${TF_TOKEN_registry_fastship_jp:-}" ]; then
-          echo "::warning::TF_TOKEN_registry_fastship_jp が設定されているため、helper ではなく、そのトークンが使われます。v2 では消してください"
+        # (Terraform は、ホストのドットを _、ハイフンを __ にした名前を読む)
+        token_var="TF_TOKEN_$(sed 's/-/__/g; s/\./_/g' <<< "$host")"
+        if [ -n "$(printenv "$token_var" || true)" ]; then
+          echo "::warning::$token_var が設定されているため、helper ではなく、そのトークンが使われます。v2 では消してください"
         fi
+        echo "host=$host" >> "$GITHUB_OUTPUT"
 
     # helper は、この Action の (固定した) コミットのソースからビルドする。配布したバイナリを信用しなくて済む
     - name: "Go を入れる"
@@ -32,6 +49,7 @@ runs:
       shell: bash
       env:
         ACTION_PATH: ${{ github.action_path }}
+        REGISTRY_HOST: ${{ steps.check.outputs.host }}
         # 呼び出し元の Go の設定 (クロスコンパイル・vendor・workspace) に左右されないようにする
         CGO_ENABLED: "0"
         GOOS: ""
@@ -51,13 +69,15 @@ runs:
         mkdir -p "$config_dir/plugins"
         (cd "$ACTION_PATH" && go build -trimpath -o "$helper" .)
 
-        block='credentials_helper "fastship" {}'
+        # ホストは、前の step で形を確かめてある
+        block="credentials_helper \"fastship\" { args = [\"--host=$REGISTRY_HOST\"] }"
         if [ -n "${TF_CLI_CONFIG_FILE:-}" ]; then
           # TF_CLI_CONFIG_FILE があると、Terraform は CLI 設定のディレクトリの *.tfrc を読まないため、そのファイルに足す
           config="$TF_CLI_CONFIG_FILE"
           if [ -f "$config" ] && grep -q 'credentials_helper' "$config"; then
-            if ! grep -q 'credentials_helper "fastship"' "$config"; then
-              echo "::error::$config に、ほかの credentials_helper があります。Terraform の CLI 設定に書ける credentials_helper は 1 つだけです"
+            # 同じ job で同じホストに 2 回使ったときは、そのままにする
+            if ! grep -qxF "$block" "$config"; then
+              echo "::error::$config に、ほかの credentials_helper (ほかのホストの fastship を含む) があります。Terraform の CLI 設定に書ける credentials_helper は 1 つだけです"
               exit 1
             fi
           else
