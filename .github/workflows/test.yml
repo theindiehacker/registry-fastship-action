@@ -62,6 +62,61 @@ jobs:
       - name: "tests/publish_test.sh"
         run: bash tests/publish_test.sh
 
+  upload:
+    name: "モジュールの upload の reusable workflow (偽の registry)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      # upload.yml の step を抜き出し、偽の ID トークンの発行元と registry で、入力の検査・zip の中身・送るリクエスト・応答ごとの失敗を確かめる
+      - name: "tests/upload_test.sh"
+        run: bash tests/upload_test.sh
+
+  upload-real:
+    name: "本物の registry が、pull_request の ID トークンでは上げさせない (403)"
+    # 上げられるイベント (push・workflow_dispatch・release) では本当に上がってしまうため、pull_request だけで動かす。
+    # fork からの PR では ID トークンを取得できないため動かさない
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      id-token: write  # registry に送る ID トークン
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      # upload.yml の upload の step を、本物の registry.fastship.jp に向けて動かす。
+      # 401 でなく 403 になれば、audience (https://<host>/v2) と組織のトークンを受け付けたうえで、イベントで断っている
+      - name: "upload の step を本物の registry に向けて動かす"
+        run: |
+          work="$RUNNER_TEMP/upload-real"
+          mkdir -p "$work/module"
+          echo 'output "ok" { value = true }' > "$work/module/main.tf"
+          (cd "$work/module" && zip -q ../module.zip main.tf)
+          yq -r '.jobs.upload.steps[] | select(.id == "upload") | .run' .github/workflows/upload.yml > "$work/upload.sh"
+          : > "$work/output"
+          set +e
+          env GITHUB_OUTPUT="$work/output" REGISTRY_URL=https://registry.fastship.jp AUDIENCE=https://registry.fastship.jp/v2 \
+            MODULE=ci/upload-test/google VERSION=0.0.1 ARCHIVE="$work/module.zip" \
+            bash --noprofile --norc -eo pipefail "$work/upload.sh"
+          code=$?
+          set -e
+          status=$(grep -E '^status=' "$work/output" | tail -1 | cut -d= -f2)
+          if [ "$code" -eq 0 ] || [ "$status" != "403" ]; then
+            echo "::error::403 で失敗するはずが、終了コード $code・HTTP ${status:-なし} だった"
+            exit 1
+          fi
+          echo "OK: pull_request の ID トークンは 403 で断られ、step も失敗した"
+
   action:
     name: "TF_TOKEN なしで terraform get できる (${{ matrix.os }})"
     # fork からの PR では ID トークンを取得できないため動かさない

@@ -1,0 +1,258 @@
+name: "🧩 モジュールの upload"
+
+# プロバイダーのリポジトリが呼ぶ reusable workflow。指定したディレクトリだけを zip にして、registry の API に上げる。
+# - 認証は GitHub Actions の ID トークン (audience は https://<host>/v2)。上げられるか (組織・イベント・保護した ref) は registry が決める
+# - 同じ版が既にあれば、registry が 409 を返し、失敗として止まる (中身が同じでも上書きしない)
+# - 処理の中身は tests/upload_test.sh が、step を抜き出して偽の registry で確かめる
+on:
+  workflow_call:
+    inputs:
+      host:
+        description: "registry のホスト名 (スキーム・ポート・パスは書かない)"
+        required: false
+        type: string
+        default: "registry.fastship.jp"
+      namespace:
+        description: "モジュールの namespace (英小文字・数字・- _)"
+        required: true
+        type: string
+      name:
+        description: "モジュールの name (英小文字・数字・- _)"
+        required: true
+        type: string
+      system:
+        description: "モジュールの system (google・aws など。英小文字・数字)"
+        required: true
+        type: string
+      path:
+        description: "モジュールのディレクトリ (リポジトリの根からの相対パス)。このディレクトリの中身だけを zip にする"
+        required: false
+        type: string
+        default: "."
+      version:
+        description: "版 (X.Y.Z。先頭の v は外す)"
+        required: true
+        type: string
+    outputs:
+      source:
+        description: "module ブロックの source (<host>/<namespace>/<name>/<system>)"
+        value: ${{ jobs.upload.outputs.source }}
+      version:
+        description: "上げた版 (X.Y.Z)"
+        value: ${{ jobs.upload.outputs.version }}
+
+permissions: {}
+
+jobs:
+  upload:
+    name: "${{ inputs.namespace }}/${{ inputs.name }}/${{ inputs.system }} ${{ inputs.version }} を上げる"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read  # 呼び出し元のリポジトリの checkout
+      id-token: write  # registry に送る ID トークン
+    outputs:
+      source: ${{ steps.check.outputs.source }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - name: "入力を確かめる"
+        id: check
+        env:
+          HOST: ${{ inputs.host }}
+          NAMESPACE: ${{ inputs.namespace }}
+          NAME: ${{ inputs.name }}
+          SYSTEM: ${{ inputs.system }}
+          VERSION: ${{ inputs.version }}
+          MODULE_PATH: ${{ inputs.path }}
+        run: |
+          export LC_ALL=C
+          host=$(tr '[:upper:]' '[:lower:]' <<< "$HOST")
+          if ! [[ "$host" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]]; then
+            echo "::error::host には、registry のホスト名 (registry.example.io の形。スキーム・ポート・パスは書かない) を書いてください: $HOST"
+            exit 1
+          fi
+          # registry と同じ形 (Terraform が読めるアドレス)。registry に送る前に断る
+          for pair in "namespace=$NAMESPACE" "name=$NAME"; do
+            if ! [[ "${pair#*=}" =~ ^[a-z0-9]([a-z0-9_-]{0,62}[a-z0-9])?$ ]]; then
+              echo "::error::${pair%%=*} には、英小文字・数字・- _ (先頭と末尾は英小文字か数字、64 文字まで) を書いてください: ${pair#*=}"
+              exit 1
+            fi
+          done
+          if ! [[ "$SYSTEM" =~ ^[a-z0-9]{1,64}$ ]]; then
+            echo "::error::system には、英小文字・数字 (google・aws など。64 文字まで) を書いてください: $SYSTEM"
+            exit 1
+          fi
+          # タグの名前 (v1.2.3) をそのまま渡せるよう、先頭の v は外す
+          version=${VERSION#v}
+          if ! [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::version には、X.Y.Z の形の版 (1.2.3 など) を書いてください: $VERSION"
+            exit 1
+          fi
+          # path は、リポジトリの中だけ (checkout の外のファイルを zip に入れさせない)
+          if [ -z "$MODULE_PATH" ] || [[ "$MODULE_PATH" == /* || "$MODULE_PATH" == "~"* || "/$MODULE_PATH/" == *"/../"* ]]; then
+            echo "::error::path には、リポジトリの中の相対パス (.. を含まない) を書いてください: $MODULE_PATH"
+            exit 1
+          fi
+          {
+            echo "host=$host"
+            echo "module=$NAMESPACE/$NAME/$SYSTEM"
+            echo "version=$version"
+            echo "source=$host/$NAMESPACE/$NAME/$SYSTEM"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: "Checkout"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: "モジュールのディレクトリを zip にする"
+        id: package
+        env:
+          MODULE_PATH: ${{ inputs.path }}
+        run: |
+          # シンボリックリンクで checkout の外を指していないか、たどった先で確かめる
+          workspace=$(realpath -e "$GITHUB_WORKSPACE")
+          dir=$(realpath -e "$MODULE_PATH") || { echo "::error::$MODULE_PATH がありません"; exit 1; }
+          if [ "$dir" != "$workspace" ] && [[ "$dir" != "$workspace/"* ]]; then
+            echo "::error::$MODULE_PATH は、リポジトリの外 ($dir) を指しています"
+            exit 1
+          fi
+          if [ ! -d "$dir" ]; then
+            echo "::error::$MODULE_PATH はディレクトリではありません"
+            exit 1
+          fi
+          archive="$RUNNER_TEMP/module.zip"
+          rm -f "$archive"
+          python3 - "$dir" "$archive" "$MODULE_PATH" <<'PY'
+          import os, sys, zipfile
+
+          root, archive, label = sys.argv[1], sys.argv[2], sys.argv[3]
+          # registry が受け付ける大きさ (AWS の Lambda に直接送れる大きさ)
+          max_bytes = 4 * 1024 * 1024
+          # 取得したもの・キャッシュは入れない
+          skipped = {".git", ".terraform"}
+
+          def fail(message):
+              print(f"::error::{message}")
+              sys.exit(1)
+
+          files = []
+          for current, dirs, names in os.walk(root):
+              dirs[:] = sorted(d for d in dirs if d not in skipped)
+              for entry in dirs + names:
+                  full = os.path.join(current, entry)
+                  rel = os.path.relpath(full, root).replace(os.sep, "/")
+                  # registry はシンボリックリンクを断る。たどって中身を入れると、checkout の外のファイルが入りうる
+                  if os.path.islink(full):
+                      fail(f"{label} の中にシンボリックリンクがあります: {rel}")
+              files += [os.path.join(current, n) for n in names]
+          if not any(os.path.dirname(f) == root and f.endswith(".tf") for f in files):
+              fail(f"{label} の直下に .tf がありません (path にはモジュールのディレクトリを書いてください)")
+
+          # 同じ中身から同じ zip を作るよう、名前の順に並べ、日時と権限をそろえる
+          with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
+              for full in sorted(files, key=lambda f: os.path.relpath(f, root).replace(os.sep, "/")):
+                  info = zipfile.ZipInfo(os.path.relpath(full, root).replace(os.sep, "/"), date_time=(1980, 1, 1, 0, 0, 0))
+                  info.external_attr = 0o100644 << 16
+                  info.compress_type = zipfile.ZIP_DEFLATED
+                  with open(full, "rb") as f:
+                      zf.writestr(info, f.read())
+          size = os.path.getsize(archive)
+          if size > max_bytes:
+              fail(f"zip が {size} バイトあり、上げられる大きさ ({max_bytes} バイト) を超えます")
+          print(f"{len(files)} 個のファイルを zip にしました ({size} バイト)")
+          PY
+          {
+            echo "archive=$archive"
+            echo "size=$(stat -c %s "$archive")"
+            echo "sha256=$(sha256sum "$archive" | cut -d' ' -f1)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: "registry に上げる"
+        id: upload
+        env:
+          REGISTRY_URL: https://${{ steps.check.outputs.host }}
+          AUDIENCE: https://${{ steps.check.outputs.host }}/v2
+          MODULE: ${{ steps.check.outputs.module }}
+          VERSION: ${{ steps.check.outputs.version }}
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+        run: |
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            echo "::error::ID トークンを取得できません。呼び出す job に permissions: id-token: write を付けてください (fork からの PR では取得できません)"
+            exit 1
+          fi
+          secrets=$(mktemp -d)
+          trap 'rm -rf "$secrets"' EXIT
+          chmod 700 "$secrets"
+          # トークンはコマンドラインに載せず、ファイルのヘッダーで渡す
+          printf 'Authorization: bearer %s\n' "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" > "$secrets/request-header"
+          if ! response=$(curl -sS --fail --max-time 30 --retry 3 --retry-delay 2 -G \
+            -H @"$secrets/request-header" --data-urlencode "audience=$AUDIENCE" "$ACTIONS_ID_TOKEN_REQUEST_URL"); then
+            echo "::error::GitHub から ID トークンを取れませんでした。時間をおいて再実行してください"
+            exit 1
+          fi
+          token=$(jq -r '.value // empty' <<< "$response" 2> /dev/null || true)
+          if ! [[ "$token" =~ ^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$ ]]; then
+            echo "::error::ID トークンの形ではない値が返りました"
+            exit 1
+          fi
+          echo "::add-mask::$token"
+          printf 'Authorization: Bearer %s\n' "$token" > "$secrets/header"
+
+          body="$secrets/response"
+          # やり直さない (上がったのに応答が届かなかったとき、やり直すと 409 になり、上がったかが分からなくなる)
+          if ! status=$(curl -sS -o "$body" -w '%{http_code}' --max-time 120 -X POST \
+            -H @"$secrets/header" -H "Content-Type: application/zip" --data-binary @"$ARCHIVE" \
+            "$REGISTRY_URL/v1/modules/$MODULE/$VERSION"); then
+            echo "::error::registry ($REGISTRY_URL) に繋がりません。上がったかは、versions ($REGISTRY_URL/v1/modules/$MODULE/versions) で確かめてください"
+            exit 1
+          fi
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          # 本文は registry のエラー (application/problem+json)。トークンは含まない
+          title=$(jq -r '.title // empty' "$body" 2> /dev/null || true)
+          case "$status" in
+            201)
+              echo "$MODULE $VERSION を上げました"
+              ;;
+            409)
+              echo "::error::$MODULE $VERSION は既にあります (削除した版も含む)。同じ版は上書きしません。中身を変えるときは、次の版で上げてください"
+              exit 1
+              ;;
+            401)
+              echo "::error::registry が ID トークンを受け付けません (HTTP 401)。registry が受け付ける GitHub 組織のリポジトリか、host が正しいかを確かめてください"
+              exit 1
+              ;;
+            403)
+              echo "::error::このワークフローからは上げられません (HTTP 403): $title"
+              echo "::error::上げられるのは、保護したデフォルトブランチか保護したタグの push・workflow_dispatch・release だけです"
+              exit 1
+              ;;
+            422)
+              echo "::error::registry がモジュールを断りました (HTTP 422): $title"
+              exit 1
+              ;;
+            *)
+              echo "::error::registry が HTTP $status を返しました: $title"
+              exit 1
+              ;;
+          esac
+
+      - name: "結果"
+        env:
+          SOURCE: ${{ steps.check.outputs.source }}
+          NAME: ${{ inputs.name }}
+          VERSION: ${{ steps.check.outputs.version }}
+          SHA256: ${{ steps.package.outputs.sha256 }}
+        run: |
+          {
+            echo "### 🧩 $SOURCE $VERSION"
+            echo
+            echo "上げました (zip の sha256: \`$SHA256\`)"
+            echo
+            echo '```hcl'
+            echo "module \"$NAME\" {"
+            echo "  source  = \"$SOURCE\""
+            echo "  version = \"$VERSION\""
+            echo "}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
