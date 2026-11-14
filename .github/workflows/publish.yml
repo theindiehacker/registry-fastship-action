@@ -183,6 +183,15 @@ jobs:
           FILE: ${{ inputs.file }}
           TARGET: ${{ inputs.target }}
         run: |
+          # シンボリックリンクで checkout の外 (docker の認証情報のある RUNNER_TEMP など) を指していないか、たどった先で確かめる
+          workspace=$(realpath -e "$GITHUB_WORKSPACE")
+          for path in "$CONTEXT" ${FILE:+"$FILE"}; do
+            resolved=$(realpath -e "$path") || { echo "::error::$path がありません"; exit 1; }
+            if [ "$resolved" != "$workspace" ] && [[ "$resolved" != "$workspace/"* ]]; then
+              echo "::error::$path は、リポジトリの外 ($resolved) を指しています"
+              exit 1
+            fi
+          done
           metadata="$RUNNER_TEMP/build-metadata.json"
           args=(
             --push

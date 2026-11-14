@@ -129,7 +129,7 @@ EOF
 image_path="test/apps/sample"
 exists_env=(REGISTRY_URL="http://$registry" IMAGE_PATH="$image_path" VERSION=v1.0.0 TOKEN=dummy)
 build_env=(IMAGE="$registry/$image_path" VERSION=v1.0.0 CONTEXT="$work/src" FILE="$work/src/app/Dockerfile" TARGET=api
-  GITHUB_REPOSITORY=theindiehacker/example GITHUB_SHA=0123456789abcdef GITHUB_SERVER_URL=https://github.com)
+  GITHUB_WORKSPACE="$work/src" GITHUB_REPOSITORY=theindiehacker/example GITHUB_SHA=0123456789abcdef GITHUB_SERVER_URL=https://github.com)
 
 if run_step exists "${exists_env[@]}" > /dev/null && [ "$(output exists)" = "false" ]; then
   pass "exists: タグが無ければ exists=false"
@@ -170,6 +170,19 @@ if [ -n "$built" ]; then
     fail "build: org.opencontainers.image.source が違う: $source_label"
   fi
 fi
+
+# リポジトリの中のシンボリックリンクで、外 (RUNNER_TEMP など) を指すものは断る
+mkdir -p "$work/outside"
+cp "$work/src/app/Dockerfile" "$work/outside/Dockerfile"
+ln -s "$work/outside" "$work/src/escape"
+for bad in "CONTEXT=$work/src/escape" "FILE=$work/src/escape/Dockerfile"; do
+  if run_step build "${build_env[@]}" VERSION=v9.9.9 "$bad" > /dev/null 2>&1; then
+    fail "build: リポジトリの外を指すシンボリックリンク ($bad) でビルドした"
+  else
+    pass "build: リポジトリの外を指すシンボリックリンク (${bad%%=*}) は断る"
+  fi
+done
+rm "$work/src/escape"
 
 if run_step exists "${exists_env[@]}" > /dev/null && [ "$(output exists)" = "true" ] && [ "$(output digest)" = "$built" ]; then
   pass "exists: 同じタグがあれば exists=true で、push したときと同じ digest を出す"
