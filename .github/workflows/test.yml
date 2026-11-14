@@ -45,6 +45,23 @@ jobs:
       - name: "go test"
         run: go test -race ./...
 
+  publish:
+    name: "イメージの publish の reusable workflow (ローカルの registry)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      # publish.yml の step を抜き出し、ローカルの registry (registry:2) で、入力の検査・スキップ・ビルドと push・digest を確かめる。
+      # WIF と本物の Artifact Registry への push は、ここでは確かめない
+      - name: "tests/publish_test.sh"
+        run: bash tests/publish_test.sh
+
   action:
     name: "TF_TOKEN なしで terraform get できる (${{ matrix.os }})"
     # fork からの PR では ID トークンを取得できないため動かさない
