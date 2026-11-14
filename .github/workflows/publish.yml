@@ -185,7 +185,9 @@ jobs:
         run: |
           # シンボリックリンクで checkout の外 (docker の認証情報のある RUNNER_TEMP など) を指していないか、たどった先で確かめる
           workspace=$(realpath -e "$GITHUB_WORKSPACE")
-          for path in "$CONTEXT" ${FILE:+"$FILE"}; do
+          # file を省略したときも、使う Dockerfile (<context>/Dockerfile) を確かめる
+          dockerfile=${FILE:-$CONTEXT/Dockerfile}
+          for path in "$CONTEXT" "$dockerfile"; do
             resolved=$(realpath -e "$path") || { echo "::error::$path がありません"; exit 1; }
             if [ "$resolved" != "$workspace" ] && [[ "$resolved" != "$workspace/"* ]]; then
               echo "::error::$path は、リポジトリの外 ($resolved) を指しています"
@@ -197,11 +199,11 @@ jobs:
             --push
             --tag "$IMAGE:$VERSION"
             --metadata-file "$metadata"
+            --file "$dockerfile"
             --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
             --label "org.opencontainers.image.revision=$GITHUB_SHA"
             --label "org.opencontainers.image.version=$VERSION"
           )
-          if [ -n "$FILE" ]; then args+=(--file "$FILE"); fi
           if [ -n "$TARGET" ]; then args+=(--target "$TARGET"); fi
           docker buildx build "${args[@]}" "$CONTEXT"
           digest=$(jq -r '."containerimage.digest" // empty' "$metadata")

@@ -183,6 +183,19 @@ for bad in "CONTEXT=$work/src/escape" "FILE=$work/src/escape/Dockerfile"; do
   fi
 done
 rm "$work/src/escape"
+mkdir -p "$work/src/linked"
+ln -s "$work/outside/Dockerfile" "$work/src/linked/Dockerfile"
+if run_step build "${build_env[@]}" VERSION=v9.9.9 CONTEXT="$work/src/linked" FILE= > /dev/null 2>&1; then
+  fail "build: file を省略し、<context>/Dockerfile が外を指すシンボリックリンクなのにビルドした"
+else
+  pass "build: file を省略しても、<context>/Dockerfile が外を指すシンボリックリンクなら断る"
+fi
+rm -r "$work/src/linked"
+if run_step build "${build_env[@]}" VERSION=v1.0.1 CONTEXT="$work/src/app" FILE= TARGET=worker > /dev/null 2>&1; then
+  pass "build: file を省略すると <context>/Dockerfile でビルドする"
+else
+  fail "build: file を省略すると、<context>/Dockerfile でビルドできない"
+fi
 
 if run_step exists "${exists_env[@]}" > /dev/null && [ "$(output exists)" = "true" ] && [ "$(output digest)" = "$built" ]; then
   pass "exists: 同じタグがあれば exists=true で、push したときと同じ digest を出す"
